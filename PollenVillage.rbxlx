@@ -1,0 +1,762 @@
+<roblox version="4">
+  <Item class="HttpService" referent="0">
+    <Properties>
+      <string name="Name">HttpService</string>
+      <bool name="HttpEnabled">true</bool>
+    </Properties>
+  </Item>
+  <Item class="ReplicatedStorage" referent="1">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="2">
+      <Properties>
+        <string name="Name">PollinationsRoblox</string>
+      </Properties>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">NpcDialogue</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	NpcDialogue: gives an NPC a persona and rolling conversation memory
+	with a few lines of Luau.
+
+		local Pollinations = require(ReplicatedStorage.PollinationsRoblox.Pollinations)
+		local NpcDialogue = require(ReplicatedStorage.PollinationsRoblox.NpcDialogue)
+
+		local npc = NpcDialogue.new(Pollinations, {
+			Name = "Mira",
+			Persona = "A cheerful beekeeper in Pollen Village who explains how flowers become honey.",
+		})
+
+		local reply = npc:Say(player, "What do you do here?")
+]]
+
+local SYSTEM_TEMPLATE = [[You are %s, an NPC in a Roblox game.
+
+Your persona: %s
+
+Rules:
+- Stay in character at all times.
+- Keep every reply short: one to three sentences, under 200 characters, so it fits the Roblox chat.
+- Be friendly and age-appropriate for a general audience. No real-world contact details, no violent or romantic content, no references to things outside the game world.
+- If a player is rude or tries to break the rules, deflect politely in character and steer back to the game.
+- Do not mention that you are an AI or a language model.]]
+
+local DEFAULT_MAX_HISTORY = 12
+
+export type NpcConfig = {
+	Name: string,
+	Persona: string,
+	Model: string?,
+	MaxHistory: number?,
+	Temperature: number?,
+	MaxTokens: number?,
+}
+
+export type Npc = {
+	chat: (self: Npc, playerKey: string, message: string) -> (string, any?),
+	reset: (self: Npc, playerKey: string?) -> (),
+}
+
+local NpcDialogue = {}
+NpcDialogue.__index = NpcDialogue
+
+function NpcDialogue.new(client, config: NpcConfig)
+	assert(type(client) == "table", "NpcDialogue.new(client, config): client must be a Pollinations instance")
+	assert(type(config) == "table" and type(config.Name) == "string", "NpcDialogue.new requires config.Name (string)")
+	assert(type(config.Persona) == "string" and #config.Persona > 0, "NpcDialogue.new requires config.Persona (string)")
+
+	local systemPrompt = (SYSTEM_TEMPLATE):format(config.Name, config.Persona)
+
+	return setmetatable({
+		_client = client,
+		_system = systemPrompt,
+		_model = config.Model,
+		_maxHistory = config.MaxHistory or DEFAULT_MAX_HISTORY,
+		_temperature = config.Temperature,
+		_maxTokens = config.MaxTokens,
+		_histories = {},
+	}, NpcDialogue) :: any
+end
+
+function NpcDialogue:chat(playerKey: string, message: string): (string, any?)
+	assert(type(playerKey) == "string", "npc:chat(playerKey, message): playerKey must be a string")
+	assert(type(message) == "string" and #message > 0, "npc:chat(playerKey, message): message must be a non-empty string")
+
+	local history = self._histories[playerKey]
+	if history == nil then
+		history = {}
+		self._histories[playerKey] = history
+	end
+
+	table.insert(history, { role = "user", content = message })
+
+	-- Trim oldest exchanges, but keep pairs coherent: keep the newest
+	-- MaxHistory messages, and never start on an assistant message.
+	local trimmed = {}
+	if #history > self._maxHistory then
+		local start = #history - self._maxHistory + 1
+		while start <= #history and history[start].role == "assistant" do
+			start += 1
+		end
+		for i = start, #history do
+			table.insert(trimmed, history[i])
+		end
+		self._histories[playerKey] = trimmed
+		history = trimmed
+	end
+
+	local messages = { { role = "system", content = self._system } }
+	for _, m in history do
+		table.insert(messages, m)
+	end
+
+	local reply, chatErr = self._client:chat(messages, {
+		model = self._model,
+		temperature = self._temperature,
+		maxTokens = self._maxTokens,
+	})
+
+	if reply then
+		table.insert(history, { role = "assistant", content = reply })
+		if #history > self._maxHistory then
+			table.remove(history, 1)
+			if history[1] and history[1].role == "assistant" then
+				table.remove(history, 1)
+			end
+		end
+		return reply, nil
+	end
+
+	-- On failure the player's message still counts as delivered; drop it
+	-- so a failed exchange doesn't leave a dangling user turn.
+	if history[#history] and history[#history].role == "user" then
+		table.remove(history)
+	end
+	return nil, chatErr
+end
+
+-- Say is the friendlier alias used in the README.
+NpcDialogue.Say = NpcDialogue.chat
+
+-- Reset one player's memory (nil resets everyone).
+function NpcDialogue:reset(playerKey: string?)
+	if playerKey == nil then
+		self._histories = {}
+	else
+		self._histories[playerKey] = nil
+	end
+end
+
+return NpcDialogue
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="4">
+        <Properties>
+          <string name="Name">Pollinations</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Pollinations client for Roblox.
+
+	One module, two runtimes:
+	  * Inside Roblox it uses HttpService for requests and Roblox's Secrets
+	    store for the API key (server scripts only).
+	  * Under lune (headless Luau) it uses the lune net library, which is
+	    how the test suite in this repository runs against the live API.
+
+	Error handling: every request method returns (result, err). On failure
+	result is nil and err is a table { kind = ..., status = ..., message = ... }
+	with kind one of "config" | "network" | "auth" | "rate_limit" |
+	"server" | "bad_request" | "parse". API failures never throw; only
+	misconfiguration throws (missing key, HttpService disabled).
+]]
+
+local DEFAULT_BASE_URL = "https://gen.pollinations.ai"
+local DEFAULT_MODEL = "openai/gpt-5.4-nano"
+local BEARER_PREFIX = "Bearer "
+
+local IS_ROBLOX = typeof(game) ~= "nil"
+	and pcall(function()
+		return game:GetService("HttpService") and true
+	end)
+
+local HttpService, SecretsService
+if IS_ROBLOX then
+	HttpService = game:GetService("HttpService")
+	pcall(function()
+		SecretsService = game:GetService("Secrets")
+	end)
+end
+
+local net, luneJson
+if not IS_ROBLOX then
+	net = require("@lune/net")
+	local serde = require("@lune/serde")
+	luneJson = {
+		encode = function(v)
+			return serde.encode("json", v)
+		end,
+		decode = function(s)
+			return serde.decode("json", s)
+		end,
+	}
+end
+
+export type ErrorKind = "config" | "network" | "auth" | "rate_limit" | "server" | "bad_request" | "parse"
+export type ApiError = { kind: ErrorKind, status: number?, message: string }
+
+export type Options = {
+	apiKey: (Secret | string)?,
+	baseUrl: string?,
+	model: string?,
+	maxRetries: number?,
+	timeoutSeconds: number?,
+}
+
+local function err(kind: ErrorKind, message: string, status: number?): ApiError
+	return { kind = kind, status = status, message = message }
+end
+
+local function authorizationHeader(apiKey: any): (any, ApiError?)
+	-- Roblox Secret from the Secrets store, or a plain string for local testing.
+	if typeof(apiKey) == "string" then
+		return BEARER_PREFIX .. apiKey, nil
+	end
+	if typeof(apiKey) == "userdata" or typeof(apiKey) == "Secret" then
+		local okPrefix, secret = pcall(function()
+			return (apiKey :: any):AddPrefix(BEARER_PREFIX)
+		end)
+		if okPrefix then
+			return secret, nil
+		end
+		return nil, err("config", "apiKey is not a string or a Roblox Secret")
+	end
+	return nil, err("config", "apiKey is not a string or a Roblox Secret")
+end
+
+local Pollinations = {}
+Pollinations.__index = Pollinations
+
+export type ChatMessage = { role: string, content: string }
+
+export type ChatOptions = {
+	model: string?,
+	maxTokens: number?,
+	temperature: number?,
+	extraBody: { [string]: any }?,
+}
+
+function Pollinations.new(options: Options?)
+	options = options or {}
+
+	local authValue, authErr
+	if options.apiKey ~= nil then
+		authValue, authErr = authorizationHeader(options.apiKey)
+		if authErr then
+			error("[Pollinations] " .. authErr.message, 2)
+		end
+	elseif IS_ROBLOX then
+		if SecretsService == nil then
+			error("[Pollinations] no apiKey given and the Secrets service is unavailable", 2)
+		end
+		local ok, secret = pcall(function()
+			return SecretsService:GetSecret("POLLINATIONS_API_KEY")
+		end)
+		if not ok then
+			error(
+				[[No API key configured.
+Get a key at https://enter.pollinations.ai/keys, then add it to the secrets
+store as POLLINATIONS_API_KEY (Creator Hub -> your experience -> Secrets),
+or pass it as Pollinations.new({ apiKey = "<key>" }) for local testing only.]],
+				2
+			)
+		end
+		authValue, authErr = authorizationHeader(secret)
+		if authErr then
+			error("[Pollinations] " .. authErr.message, 2)
+		end
+	else
+		error("[Pollinations] an apiKey is required when running outside Roblox", 2)
+	end
+
+	if IS_ROBLOX and not HttpService.HttpEnabled then
+		error("[Pollinations] HttpService must be enabled (Game Settings -> Security -> Allow HTTP Requests)", 2)
+	end
+
+	return setmetatable({
+		_auth = authValue,
+		_baseUrl = (options.baseUrl or DEFAULT_BASE_URL):gsub("/+$", ""),
+		_model = options.model or DEFAULT_MODEL,
+		_maxRetries = options.maxRetries or 2,
+		_timeout = options.timeoutSeconds or 30,
+	}, Pollinations)
+end
+
+-- Convenience constructor: key straight from Roblox's secrets store.
+function Pollinations.fromSecretsStore(secretName: string?, options: Options?)
+	local IS_ROBLOX_ = typeof(game) ~= "nil"
+	assert(IS_ROBLOX_, "fromSecretsStore only works inside Roblox")
+	local svc = game:GetService("Secrets")
+	local ok, secret = pcall(function()
+		return svc:GetSecret(secretName or "POLLINATIONS_API_KEY")
+	end)
+	if not ok then
+		error(
+			('Secret "%s" is not configured. Add it under Creator Hub -> your experience -> Secrets, or pass Pollinations.new({ apiKey = ... }).'):format(
+				secretName or "POLLINATIONS_API_KEY"
+			),
+			2
+		)
+	end
+	local opts = table.clone(options or {})
+	opts.apiKey = secret
+	return Pollinations.new(opts)
+end
+
+function Pollinations:_request(method: string, path: string, body: string?): (string, ApiError?)
+	local headers = { ["Content-Type"] = "application/json", Authorization = self._auth }
+	local delaySeconds = 1
+	local lastErr: ApiError? = nil
+
+	for attempt = 0, self._maxRetries do
+		local code, responseBody
+		if IS_ROBLOX then
+			local ok, response = pcall(function()
+				return HttpService:RequestAsync({
+					Method = method,
+					Url = self._baseUrl .. path,
+					Headers = headers,
+					Body = body,
+					Timeout = self._timeout,
+				})
+			end)
+			if not ok then
+				code, responseBody = nil, tostring(response)
+			elseif not response.Success then
+				code, responseBody = nil, ("HTTP request failed: %s"):format(tostring(response.HttpError or ""))
+			else
+				code, responseBody = response.StatusCode, response.Body
+			end
+		else
+			local ok, response = pcall(function()
+				return net.request({
+					method = method,
+					url = self._baseUrl .. path,
+					headers = headers,
+					body = body,
+				})
+			end)
+			if not ok then
+				code, responseBody = nil, tostring(response)
+			else
+				code, responseBody = response.statusCode, response.body
+			end
+		end
+
+		if code == nil then
+			lastErr = err("network", ("request failed: %s"):format(tostring(responseBody)))
+		elseif code >= 200 and code < 300 then
+			return responseBody, nil
+		else
+			local kind
+			if code == 401 or code == 403 then
+				kind = "auth"
+			elseif code == 429 then
+				kind = "rate_limit"
+			elseif code >= 500 then
+				kind = "server"
+			else
+				kind = "bad_request"
+			end
+			lastErr = err(kind, ("HTTP %d: %s"):format(code, tostring(responseBody)), code)
+			-- Only rate limiting and transient server errors are retried.
+			if kind ~= "rate_limit" and kind ~= "server" then
+				return nil, lastErr
+			end
+		end
+
+		if attempt < self._maxRetries then
+			if IS_ROBLOX then
+				task.wait(delaySeconds)
+			else
+				-- lune has no task library; short busy-wait keeps retries testable
+				local until_ = os.clock() + delaySeconds
+				while os.clock() < until_ do end
+			end
+			delaySeconds *= 2
+		end
+	end
+
+	return nil, lastErr
+end
+
+local function decodeJson(text: string): (any, ApiError?)
+	if IS_ROBLOX then
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(text)
+		end)
+		if ok then
+			return data, nil
+		end
+		return nil, err("parse", "invalid JSON in response")
+	end
+	local ok, data = pcall(function()
+		return luneJson.decode(text)
+	end)
+	if ok then
+		return data, nil
+	end
+	return nil, err("parse", "invalid JSON in response")
+end
+
+-- POST /v1/chat/completions. messages is an array of { role, content }.
+-- Returns (reply: string, err: ApiError?).
+function Pollinations:chat(messages: { ChatMessage }, options: ChatOptions?)
+	options = options or {}
+	local body: { [string]: any } = {
+		model = options.model or self._model,
+		messages = messages,
+	}
+	if options.maxTokens then
+		body.max_tokens = options.maxTokens
+	end
+	if options.temperature then
+		body.temperature = options.temperature
+	end
+	for k, v in options.extraBody or {} do
+		body[k] = v
+	end
+
+	local encoded
+	if IS_ROBLOX then
+		encoded = HttpService:JSONEncode(body)
+	else
+		encoded = luneJson.encode(body)
+	end
+
+	local responseBody, reqErr = self:_request("POST", "/v1/chat/completions", encoded)
+	if reqErr then
+		return nil, reqErr
+	end
+
+	local data, parseErr = decodeJson(responseBody)
+	if parseErr then
+		return nil, parseErr
+	end
+	local choices = (data :: any).choices
+	if typeof(choices) ~= "table" or #choices == 0 or typeof(choices[1].message) ~= "table" then
+		return nil, err("parse", "response had no choices[1].message")
+	end
+	local content = choices[1].message.content
+	if typeof(content) ~= "string" then
+		-- some models return content as an array of parts
+		if typeof(content) == "table" then
+			local parts = {}
+			for _, part in content do
+				if typeof(part) == "table" and typeof(part.text) == "string" then
+					table.insert(parts, part.text)
+				end
+			end
+			if #parts > 0 then
+				return table.concat(parts), nil
+			end
+		end
+		return nil, err("parse", "response content was not text")
+	end
+	return content, nil
+end
+
+-- One-shot text: GET /text/{prompt}. Returns (text, err).
+function Pollinations:ask(prompt: string, options: { model: string? }?)
+	local model = (options and options.model) or self._model
+	local escaped = (prompt:gsub("[^%w _%-%.~]", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end))
+	local responseBody, reqErr = self:_request("GET", "/text/" .. escaped .. "?model=" .. model, nil)
+	if reqErr then
+		return nil, reqErr
+	end
+	return responseBody, nil
+end
+
+-- Live text model list. Returns (models, err).
+function Pollinations:listModels()
+	local responseBody, reqErr = self:_request("GET", "/text/models", nil)
+	if reqErr then
+		return nil, reqErr
+	end
+	local data, parseErr = decodeJson(responseBody)
+	if parseErr then
+		return nil, parseErr
+	end
+	if typeof(data) ~= "table" then
+		return nil, err("parse", "model list was not an array")
+	end
+	return data, nil
+end
+
+-- The default model this client will use.
+function Pollinations:defaultModel(): string
+	return self._model
+end
+
+return Pollinations
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="5">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Script" referent="6">
+      <Properties>
+        <string name="Name">PollenVillage</string>
+        <token name="RunContext">0</token>
+        <string name="Source"><![CDATA[--!strict
+--[[
+	Pollen Village example: one talking NPC, powered by Pollinations.
+
+	Server side: builds the NPC at runtime, starts conversations with a
+	ProximityPrompt, and forwards what the player types in chat while the
+	conversation is open. The reply is sent to the player's client, which
+	displays it in the Roblox chat.
+
+	Requires:
+	  * HttpService enabled (Game Settings -> Security -> Allow HTTP Requests)
+	  * A secret named POLLINATIONS_API_KEY in the secrets store
+	    (Creator Hub -> your experience -> Secrets), or Pollinations.new({ apiKey = "..." })
+	    for local testing only.
+
+	Any model from the live list works: https://gen.pollinations.ai/text/models
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TextChatService = game:GetService("TextChatService")
+
+local Pollinations = require(ReplicatedStorage.PollinationsRoblox.Pollinations)
+local NpcDialogue = require(ReplicatedStorage.PollinationsRoblox.NpcDialogue)
+
+-- Any text model from the live model list.
+local MODEL = "openai/gpt-5.4-nano"
+
+-- Remote event the client listens on for NPC replies.
+local replyEvent = Instance.new("RemoteEvent")
+replyEvent.Name = "NpcReply"
+replyEvent.Parent = ReplicatedStorage
+
+--------------------------------------------------------------------
+-- Build the NPC at runtime: a simple rig standing in the village.
+--------------------------------------------------------------------
+local function buildNpc(): Model
+	local npc = Instance.new("Model")
+	npc.Name = "Mira"
+
+	local body = Instance.new("Part")
+	body.Name = "Body"
+	body.Size = Vector3.new(2, 3, 1)
+	body.Color = Color3.fromRGB(255, 205, 66)
+	body.Material = Enum.Material.SmoothPlastic
+	body.CFrame = CFrame.new(0, 3.5, -15)
+	body.Anchored = true
+	body.Parent = npc
+
+	local head = Instance.new("Part")
+	head.Name = "Head"
+	head.Size = Vector3.new(1.4, 1.4, 1.4)
+	head.Shape = Enum.PartType.Ball
+	head.Color = Color3.fromRGB(255, 235, 160)
+	head.Material = Enum.Material.SmoothPlastic
+	head.CFrame = CFrame.new(0, 6.2, -15)
+	head.Anchored = true
+	head.Parent = npc
+
+	local face = Instance.new("Decal")
+	face.Texture = "rbxasset://textures/face.png"
+	face.Face = Enum.NormalId.Front
+	face.Parent = head
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "TalkPrompt"
+	prompt.ActionText = "Talk to Mira"
+	prompt.ObjectText = "Mira the Beekeeper"
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = 12
+	prompt.RequiresLineOfSight = false
+	prompt.Parent = body
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "NameTag"
+	billboard.Size = UDim2.fromOffset(200, 40)
+	billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.2, 0)
+	billboard.AlwaysOnTop = true
+	billboard.Adornee = head
+	billboard.Parent = head
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Text = "Mira the Beekeeper"
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextStrokeTransparency = 0.2
+	label.TextScaled = true
+	label.Font = Enum.Font.GothamBold
+	label.Parent = billboard
+
+	npc.Parent = workspace
+	return npc
+end
+
+--------------------------------------------------------------------
+-- Wire the conversation
+--------------------------------------------------------------------
+local client = Pollinations.fromSecretsStore() -- from the secrets store
+local mira = NpcDialogue.new(client, {
+	Name = "Mira",
+	Persona = "A cheerful beekeeper in Pollen Village who explains how flowers become honey. You love questions about bees, honey and the village.",
+	Model = MODEL,
+	MaxHistory = 12,
+})
+
+-- Which players currently have the conversation open, by UserId.
+local openConversations: { [number]: boolean } = {}
+
+local npcModel = buildNpc()
+local prompt = npcModel.Body:FindFirstChildOfClass("ProximityPrompt")
+
+prompt.Triggered:Connect(function(player)
+	if openConversations[player.UserId] then
+		openConversations[player.UserId] = nil
+		replyEvent:FireClient(player, "Mira", "See you around, friend!")
+	else
+		openConversations[player.UserId] = true
+		replyEvent:FireClient(
+			player,
+			"Mira",
+			"Hello! I'm Mira the beekeeper. Type your questions in chat, and press the prompt again when you're done."
+		)
+	end
+end)
+
+-- Forward chat messages from players with an open conversation to the NPC.
+TextChatService.MessageReceived:Connect(function(message)
+	local source = message.TextSource
+	if source == nil then
+		return
+	end
+	local player = game:GetService("Players"):GetPlayerByUserId(source.UserId)
+	if player == nil or not openConversations[player.UserId] then
+		return
+	end
+
+	local reply, err = mira:chat(tostring(source.UserId), message.Text)
+	if reply then
+		replyEvent:FireClient(player, "Mira", reply)
+	else
+		-- The NPC stays silent, the game keeps running: see README on error kinds.
+		warn(("[Pollinations] NPC reply failed: %s"):format(err and err.message or "unknown"))
+		replyEvent:FireClient(player, "Mira", "*Mira hums to herself and doesn't hear you. Try again in a moment.*")
+	end
+end)
+
+game:GetService("Players").PlayerRemoving:Connect(function(player)
+	openConversations[player.UserId] = nil
+	mira:reset(tostring(player.UserId))
+end)
+]]></string>
+      </Properties>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="7">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="8">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="LocalScript" referent="9">
+        <Properties>
+          <string name="Name">PollenVillageClient</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Pollen Village example: client side.
+
+	Listens for NPC replies from the server and shows them in the default
+	Roblox chat as system messages (no chat filtering concerns: the reply
+	is only ever displayed to the single player who asked, on their own
+	client, via DisplaySystemMessage).
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TextChatService = game:GetService("TextChatService")
+
+local replyEvent = ReplicatedStorage:WaitForChild("NpcReply")
+
+replyEvent.OnClientEvent:Connect(function(npcName: string, text: string)
+	local general = TextChatService:FindFirstChild("TextChannels")
+		and TextChatService.TextChannels:FindFirstChild("RBXGeneral")
+	if general then
+		(general :: any):DisplaySystemMessage(("%s: %s"):format(npcName, text))
+	else
+		print(("%s: %s"):format(npcName, text))
+	end
+end)
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="TextChatService" referent="10">
+    <Properties>
+      <string name="Name">TextChatService</string>
+      <token name="ChatVersion">1</token>
+    </Properties>
+  </Item>
+  <Item class="Workspace" referent="11">
+    <Properties>
+      <string name="Name">Workspace</string>
+      <bool name="FilteringEnabled">true</bool>
+      <bool name="NeedsPivotMigration">false</bool>
+    </Properties>
+    <Item class="Part" referent="12">
+      <Properties>
+        <string name="Name">Baseplate</string>
+        <bool name="Anchored">true</bool>
+        <Color3uint8 name="Color3uint8">6527331</Color3uint8>
+        <bool name="Locked">true</bool>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>-10</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>512</X>
+          <Y>20</Y>
+          <Z>512</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+    <Item class="SpawnLocation" referent="13">
+      <Properties>
+        <string name="Name">SpawnLocation</string>
+        <bool name="Anchored">true</bool>
+        <int name="Duration">0</int>
+        <bool name="Neutral">true</bool>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>0.5</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>12</X>
+          <Y>1</Y>
+          <Z>12</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
