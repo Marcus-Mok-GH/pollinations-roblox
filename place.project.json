@@ -1,0 +1,64 @@
+{
+    "name": "PollenVillage",
+    "tree": {
+        "$className": "DataModel",
+        "HttpService": {
+            "$properties": {
+                "HttpEnabled": true
+            }
+        },
+        "TextChatService": {
+            "$properties": {
+                "ChatVersion": "TextChatService"
+            }
+        },
+        "ReplicatedStorage": {
+            "$className": "ReplicatedStorage",
+            "PollinationsRoblox": {
+                "$path": "src"
+            }
+        },
+        "ServerScriptService": {
+            "$className": "ServerScriptService",
+            "PollenVillage": {
+                "$path": "example/PollenVillage.server.luau"
+            }
+        },
+        "StarterPlayer": {
+            "$className": "StarterPlayer",
+            "StarterPlayerScripts": {
+                "$className": "StarterPlayerScripts",
+                "PollenVillageClient": {
+                    "$path": "example/PollenVillage.client.luau"
+                }
+            }
+        },
+        "Workspace": {
+            "$className": "Workspace",
+            "$properties": {
+                "FilteringEnabled": true
+            },
+            "Baseplate": {
+                "$className": "Part",
+                "$properties": {
+                    "Name": "Baseplate",
+                    "Anchored": true,
+                    "Locked": true,
+                    "Size": [512, 20, 512],
+                    "Position": [0, -10, 0],
+                    "Color": [0.388235, 0.6, 0.388235]
+                }
+            },
+            "SpawnLocation": {
+                "$className": "SpawnLocation",
+                "$properties": {
+                    "Anchored": true,
+                    "Size": [12, 1, 12],
+                    "Position": [0, 0.5, 0],
+                    "Neutral": true,
+                    "Duration": 0
+                }
+            }
+        }
+    }
+}

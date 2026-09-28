@@ -1,0 +1,9 @@
+{
+    "name": "pollinations-roblox",
+    "tree": {
+        "$className": "Folder",
+        "PollinationsRoblox": {
+            "$path": "src"
+        }
+    }
+}
